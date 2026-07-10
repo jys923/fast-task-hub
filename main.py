@@ -1,29 +1,27 @@
-import time
 from fastapi import FastAPI, Depends, HTTPException
+from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
-from pydantic import BaseModel, EmailStr
-from tasks import send_welcome_email_async
 
-# 1. Database 설정 (로컬 SQLite 파일 사용)
+# tasks.py에서 Celery 앱 임포트
+from tasks import celery_app, send_welcome_email_async
+
 DATABASE_URL = "sqlite:///./local_service.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# 2. DB 테이블 모델 정의
 class UserORM(Base):
     __tablename__ = "users"
-
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True)
     name = Column(String)
-    status = Column(String, default="PENDING")
+    status = Column(String, default="STEP_1_RECEIVED")
 
-# 서버 시작 시 테이블 자동 생성
 Base.metadata.create_all(bind=engine)
 
-# DB 세션 의존성 주입 함수
+app = FastAPI(title="Pure DB-Driven Progress Hub")
+
 def get_db():
     db = SessionLocal()
     try:
@@ -31,57 +29,58 @@ def get_db():
     finally:
         db.close()
 
-# 3. Request용 Pydantic 스키마 정의
 class UserCreate(BaseModel):
     email: EmailStr
     name: str
 
-# 4. FastAPI 앱 선언
-app = FastAPI(title="Fast Task Hub - Step 1")
-
-# 가상의 무거운 이메일 발송 함수 (동기식)
-def send_welcome_email_sync(email: str, name: str):
-    print(f"[Email] '{email}' 주소로 환영 메일 발송 시작 (5초 소요)...")
-    time.sleep(5)  # 5초간 네트워크 지연 시뮬레이션
-    print(f"[Email] '{email}' 주소로 환영 메일 발송 완료!")
-
-# 5. API 엔드포인트 구현
+# 1. 회원가입 요청 API (응답으로 user_id를 확실하게 반환합니다)
 @app.post("/users", status_code=201)
 def create_user(user_data: UserCreate, db: Session = Depends(get_db)):
     existing_user = db.query(UserORM).filter(UserORM.email == user_data.email).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="이미 존재하는 이메일입니다.")
     
-    new_user = UserORM(email=user_data.email, name=user_data.name, status="PENDING")
+    new_user = UserORM(email=user_data.email, name=user_data.name, status="STEP_1_RECEIVED")
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
     
-    # ❌ [기존 동기 방식 제거]
-    # send_welcome_email_sync(new_user.email, new_user.name)
-    
-    # ⭕ [새로운 비동기 방식 도입] 
-    # 레디스 큐에 유저 ID 하나만 툭 던지고 즉시 다음 줄로 넘어갑니다.
+    # Celery 일꾼에게 작업을 넘깁니다.
     send_welcome_email_async.delay(new_user.id)
     
+    # 🌟 프론트엔드가 조회할 수 있도록 user_id를 명확하게 리턴합니다.
     return {
-        "message": "회원가입 접수가 완료되었습니다. 환영 메일은 백그라운드에서 발송됩니다.",
-        "user": {
-            "id": new_user.id,
-            "email": new_user.email,
-            "name": new_user.name,
-            "status": new_user.status  # 현재는 PENDING 상태로 즉시 반환됨
-        }
+        "message": "회원가입 접수 완료",
+        "user_id": new_user.id,
+        "status": new_user.status
     }
 
-@app.get("/users/{user_id}")
-def get_user_status(user_id: int, db: Session = Depends(get_db)):
+# 2. 실시간 진행률 조회 API (발급받은 user_id 하나로만 깔끔하게 찌릅니다)
+@app.get("/users/{user_id}/progress")
+def get_user_progress(user_id: int, db: Session = Depends(get_db)):
+    # DB에서 유저의 현재 세분화 상태 획득
     user = db.query(UserORM).filter(UserORM.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="유저를 찾을 수 없습니다.")
+    
+    # 상태별 퍼센트 및 메시지 매핑 체계
+    status_map = {
+        "STEP_1_RECEIVED": {"percentage": 0.0, "msg": "회원가입 요청 접수됨", "completed": False},
+        "STEP_2_VALIDATED": {"percentage": 25.0, "msg": "유저 정보 검증 중...", "completed": False},
+        "STEP_3_EMAIL_GENERATED": {"percentage": 50.0, "msg": "환영 이메일 템플릿 생성 중...", "completed": False},
+        "STEP_4_EMAIL_SENT": {"percentage": 75.0, "msg": "이메일 실제 발송 중...", "completed": False},
+        "ACTIVE": {"percentage": 100.0, "msg": "가입 승인 및 이메일 발송 완료", "completed": True}
+    }
+    
+    current_progress = status_map.get(
+        user.status, 
+        {"percentage": 0.0, "msg": "상태 확인 불가", "completed": False}
+    )
+
     return {
-        "id": user.id,
-        "email": user.email,
-        "name": user.name,
-        "status": user.status
+        "user_id": user.id,
+        "business_status": user.status,
+        "percentage": current_progress["percentage"],
+        "status_message": current_progress["msg"],
+        "is_completed": current_progress["completed"]
     }
