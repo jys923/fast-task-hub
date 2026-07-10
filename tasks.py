@@ -3,13 +3,13 @@ from celery import Celery
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-# 1. Celery 인스턴스 생성 (우체통으로 Redis 지정)
+# 1. Celery 인스턴스 생성 (우체통 주소를 RabbitMQ로 변경)
+# 형식: amqp://계정:비밀번호@호스트:포트//
 celery_app = Celery(
     "tasks",
-    broker="redis://127.0.0.1:6379/0",
-    backend="redis://127.0.0.1:6379/0"
+    broker="amqp://yoon:password123@127.0.0.1:5672//",
+    backend="rpc://"  # RabbitMQ 환경에서는 rpc://를 백엔드로 쓰는 것이 안정적이고 매끄럽습니다.
 )
-
 # 2. Celery 태스크 내부에서 DB에 접근하기 위한 설정 (main.py와 동일한 DB)
 DATABASE_URL = "sqlite:///./local_service.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})

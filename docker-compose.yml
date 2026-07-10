@@ -1,8 +1,18 @@
 version: '3.8'
 
 services:
-  redis:
-    image: redis:7-alpine
-    container_name: task_hub_redis
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    container_name: rabbitmq_broker
     ports:
-      - "6379:6379"
+      - "5672:5672"       # Celery 일꾼과 FastAPI가 메시지를 주고받는 실제 포트
+      - "15672:15672"     # 웹 브라우저로 접속할 관리자 대시보드 포트
+    environment:
+      - RABBITMQ_DEFAULT_USER=yoon
+      - RABBITMQ_DEFAULT_PASS=password123
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    restart: always
+
+volumes:
+  rabbitmq_data:
