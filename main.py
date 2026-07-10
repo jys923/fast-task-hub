@@ -3,6 +3,7 @@ from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from pydantic import BaseModel, EmailStr
+from tasks import send_welcome_email_async
 
 # 1. Database 설정 (로컬 SQLite 파일 사용)
 DATABASE_URL = "sqlite:///./local_service.db"
@@ -47,32 +48,29 @@ def send_welcome_email_sync(email: str, name: str):
 # 5. API 엔드포인트 구현
 @app.post("/users", status_code=201)
 def create_user(user_data: UserCreate, db: Session = Depends(get_db)):
-    # 1) 이미 가입된 이메일인지 체크
     existing_user = db.query(UserORM).filter(UserORM.email == user_data.email).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="이미 존재하는 이메일입니다.")
     
-    # 2) DB에 회원 정보 저장 (기본 상태는 PENDING)
     new_user = UserORM(email=user_data.email, name=user_data.name, status="PENDING")
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
     
-    # 3) [문제의 구간] 그 자리에서 무거운 이메일 발송 로직 직접 실행
-    send_welcome_email_sync(new_user.email, new_user.name)
+    # ❌ [기존 동기 방식 제거]
+    # send_welcome_email_sync(new_user.email, new_user.name)
     
-    # 4) 이메일 발송이 무사히 끝나면 상태를 ACTIVE로 변경
-    new_user.status = "ACTIVE"
-    db.commit()
-    db.refresh(new_user)
+    # ⭕ [새로운 비동기 방식 도입] 
+    # 레디스 큐에 유저 ID 하나만 툭 던지고 즉시 다음 줄로 넘어갑니다.
+    send_welcome_email_async.delay(new_user.id)
     
     return {
-        "message": "회원가입 및 이메일 발송이 완료되었습니다.",
+        "message": "회원가입 접수가 완료되었습니다. 환영 메일은 백그라운드에서 발송됩니다.",
         "user": {
             "id": new_user.id,
             "email": new_user.email,
             "name": new_user.name,
-            "status": new_user.status
+            "status": new_user.status  # 현재는 PENDING 상태로 즉시 반환됨
         }
     }
 

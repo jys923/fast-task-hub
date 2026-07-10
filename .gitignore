@@ -40,3 +40,7 @@ Thumbs.db
 *.key
 *.pem
 secrets.txt
+
+# --- DB ---
+local_service.db
+*.db
