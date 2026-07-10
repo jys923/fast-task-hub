@@ -162,3 +162,56 @@ uvicorn main:app --reload
 2. 응답으로 즉시 고유 식별자인 `"user_id"`를 반환받습니다.
 3. 곧바로 `GET /users/{user_id}/progress` 엔드포인트를 1~2초 간격으로 연속 호출합니다.
 4. DB 장부와 동기화되어 25% -> 50% -> 75% -> 100%로 다이내믹하게 차오르는 실시간 진행 상태 데이터를 확인할 수 있습니다.
+
+# Fast Task Hub Pro - RPC Backend Progress System
+
+RabbitMQ와 Celery의 내장 결과 저장소(`backend="rpc://"`) 아키텍처를 극한으로 활용하여, 진짜 장부(DB)를 거치지 않고 오직 인프라 메시징 자원만으로 비동기 작업의 실시간 진행률을 추적하는 고도화된 백엔드 시스템입니다.
+
+## 1. 아키텍처 핵심 설계 (RPC Backend-Driven)
+본 시스템은 데이터베이스에 불필요한 I/O 부하를 주지 않고, RabbitMQ 내부의 임시 메시지 채널을 통해 작업의 상태를 주고받도록 설계되었습니다.
+
+* **Broker (RabbitMQ):** FastAPI가 발행한 작업 주문서를 Celery 일꾼에게 안전하게 배달합니다.
+* **Backend (RabbitMQ RPC):** Celery 일꾼이 `self.update_state()`를 통해 발행하는 실시간 상태(PROGRESS) 및 최종 결과물(SUCCESS)을 임시 큐(Queue) 형태로 관리하는 영수증 보관함 역할을 합니다.
+* **Master DB (SQLite / SQLAlchemy):** 영구 저장이 필요한 회원의 기본 정보(이메일, 이름 등)만 딱 한 번 저장하며, 중간 진행 상황 추적 연산에는 전혀 관여하지 않습니다.
+* **FastAPI:** 회원가입 성공 시 발급된 고유 영수증 번호(`task_id`)를 사용하여 RabbitMQ RPC 저장소를 직접 찔러 실시간 진행률을 프론트엔드에 내려줍니다.
+
+---
+
+## 2. 실시간 상태 및 퍼센트 매핑 규격
+
+Celery 일꾼이 단계를 밟을 때마다 RabbitMQ RPC 백엔드에 기록되는 실시간 메타데이터 구조입니다.
+
+| Celery 상태 (`state`) | 진행률 (`percentage`) | 화면 표시 메시지 (`status_message`) |
+| :--- | :---: | :--- |
+| `PENDING` | 0.0% | 작업이 큐에서 대기 중이거나 처리 시작 전입니다. |
+| `PROGRESS` (1단계) | 25.0% | 유저 정보 검증 중... |
+| `PROGRESS` (2단계) | 50.0% | 환영 이메일 템플릿 생성 중... |
+| `PROGRESS` (3단계) | 75.0% | 이메일 실제 발송 중... |
+| `SUCCESS` (최종 완료) | 100.0% | 가입 승인 및 이메일 발송 완료 |
+
+---
+
+## 3. 실행 및 테스트 방법
+
+### Step 1: 일꾼(Celery) 실행
+리눅스/WSL 환경에서 프로세스 간 잠금 및 격리 문제를 방지하기 위해 일꾼을 단일 가동 모드(`-P solo`)로 실행합니다.
+```bash
+celery -A tasks.celery_app worker --loglevel=info -P solo
+
+```
+
+### Step 2: 웹 서버(FastAPI) 실행
+
+```bash
+uvicorn main:app --reload
+
+```
+
+### Step 3: 실시간 검증 시나리오
+
+1. `POST /users` 엔드포인트를 통해 신규 회원가입을 요청합니다.
+2. 응답으로 즉시 고유 영수증 번호인 `"task_id"`를 반환받습니다.
+3. 곧바로 `GET /tasks/{task_id}/progress` 엔드포인트를 1~2초 간격으로 연속 호출합니다.
+4. 진짜 장부(DB) 조회를 완전히 배제한 상태에서, RabbitMQ RPC 자원만으로 25% -> 50% -> 75% -> 100%로 다이내믹하게 차오르는 실시간 진행 상태 데이터를 확인할 수 있습니다.
+
+---

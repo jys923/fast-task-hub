@@ -2,8 +2,9 @@ from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from celery.result import AsyncResult
 
-# tasks.py에서 Celery 앱 임포트
+# tasks.py에서 Celery 앱과 태스크 함수 임포트
 from tasks import celery_app, send_welcome_email_async
 
 DATABASE_URL = "sqlite:///./local_service.db"
@@ -16,11 +17,11 @@ class UserORM(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True)
     name = Column(String)
-    status = Column(String, default="STEP_1_RECEIVED")
+    # 🌟 이제 DB에는 상태 변환 이정표를 적지 않습니다. 오직 정보 저장용!
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Pure DB-Driven Progress Hub")
+app = FastAPI(title="RPC Backend Progress Hub")
 
 def get_db():
     db = SessionLocal()
@@ -33,54 +34,53 @@ class UserCreate(BaseModel):
     email: EmailStr
     name: str
 
-# 1. 회원가입 요청 API (응답으로 user_id를 확실하게 반환합니다)
 @app.post("/users", status_code=201)
 def create_user(user_data: UserCreate, db: Session = Depends(get_db)):
     existing_user = db.query(UserORM).filter(UserORM.email == user_data.email).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="이미 존재하는 이메일입니다.")
     
-    new_user = UserORM(email=user_data.email, name=user_data.name, status="STEP_1_RECEIVED")
+    new_user = UserORM(email=user_data.email, name=user_data.name)
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
     
-    # Celery 일꾼에게 작업을 넘깁니다.
-    send_welcome_email_async.delay(new_user.id)
+    # 🌟 비동기 태스크를 발행하고, 래빗엠큐 RPC 장부 접근용 task_id를 확보합니다.
+    task_result = send_welcome_email_async.delay(new_user.id)
     
-    # 🌟 프론트엔드가 조회할 수 있도록 user_id를 명확하게 리턴합니다.
     return {
         "message": "회원가입 접수 완료",
         "user_id": new_user.id,
-        "status": new_user.status
+        "task_id": task_result.id  # 🌟 UI가 진행률을 조회할 때 쓸 영수증 번호 반환!
     }
 
-# 2. 실시간 진행률 조회 API (발급받은 user_id 하나로만 깔끔하게 찌릅니다)
-@app.get("/users/{user_id}/progress")
-def get_user_progress(user_id: int, db: Session = Depends(get_db)):
-    # DB에서 유저의 현재 세분화 상태 획득
-    user = db.query(UserORM).filter(UserORM.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="유저를 찾을 수 없습니다.")
+# 🌟 래빗엠큐 RPC 결과 저장소에서 실시간으로 진행률 영수증을 가로채는 API
+@app.get("/tasks/{task_id}/progress")
+def get_task_progress(task_id: str):
+    # Celery RPC 백엔드 장부에서 영수증 번호로 상태 직접 조회
+    res = AsyncResult(task_id, app=celery_app)
     
-    # 상태별 퍼센트 및 메시지 매핑 체계
-    status_map = {
-        "STEP_1_RECEIVED": {"percentage": 0.0, "msg": "회원가입 요청 접수됨", "completed": False},
-        "STEP_2_VALIDATED": {"percentage": 25.0, "msg": "유저 정보 검증 중...", "completed": False},
-        "STEP_3_EMAIL_GENERATED": {"percentage": 50.0, "msg": "환영 이메일 템플릿 생성 중...", "completed": False},
-        "STEP_4_EMAIL_SENT": {"percentage": 75.0, "msg": "이메일 실제 발송 중...", "completed": False},
-        "ACTIVE": {"percentage": 100.0, "msg": "가입 승인 및 이메일 발송 완료", "completed": True}
-    }
+    percentage = 0.0
+    status_message = "대기 중..."
+    is_completed = False
     
-    current_progress = status_map.get(
-        user.status, 
-        {"percentage": 0.0, "msg": "상태 확인 불가", "completed": False}
-    )
+    # RPC 백엔드가 가로챈 실시간 상태 처리 파트
+    if res.state == "PROGRESS":
+        percentage = res.info.get("current", 0.0)
+        status_message = res.info.get("msg", "")
+    elif res.state == "SUCCESS":
+        percentage = 100.0
+        status_message = res.result.get("msg", "완료") if isinstance(res.result, dict) else "완료"
+        is_completed = True
+    elif res.state == "FAILURE":
+        status_message = "작업 처리 중 시스템 에러 발생"
+    elif res.state == "PENDING":
+        status_message = "작업이 큐에서 대기 중이거나 처리 시작 전입니다."
 
     return {
-        "user_id": user.id,
-        "business_status": user.status,
-        "percentage": current_progress["percentage"],
-        "status_message": current_progress["msg"],
-        "is_completed": current_progress["completed"]
+        "task_id": task_id,
+        "celery_state": res.state,      # 래빗엠큐가 전달한 내장 상태 (PROGRESS, SUCCESS 등)
+        "percentage": percentage,       # RPC 메타데이터에서 추출한 진행률
+        "status_message": status_message,
+        "is_completed": is_completed
     }
